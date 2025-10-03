@@ -1,6 +1,6 @@
 # tfl_journey_planner.py
 # Streamlit TfL Journey Planner — friendly accessibility, robust selection, URL-encoding,
-# London-time handling, graceful 404, main-page filters/sorting, and "Show top N".
+# London-time handling, graceful 404, and simple main-page sorting over all journeys.
 
 import streamlit as st
 import requests
@@ -507,28 +507,16 @@ if search_button:
                 st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
                 st.caption("🕒 All times below are shown in **London time**.")
 
-                # ── Result-level filters & sorting (MAIN PAGE) ──────────────────
-                with st.expander("🔎 Filter & sort results", expanded=True):
-                    fc1, fc2, fc3, fc4 = st.columns(4)
+                # ── Simple sorting (MAIN PAGE) ──────────────────────────────────
+                with st.expander("🔎 Sort results", expanded=True):
+                    sort_option = st.radio(
+                        "Sort by",
+                        ["Fastest", "Cheapest", "Least Walking"],
+                        index=0,
+                        horizontal=True,
+                    )
 
-                    with fc1:
-                        sort_option = st.radio(
-                            "Sort by",
-                            ["Fastest", "Cheapest", "Least Walking"],
-                            index=0,
-                            horizontal=True,
-                        )
-
-                    with fc2:
-                        max_duration = st.slider("Max duration (min)", 10, 180, 120, step=5)
-
-                    with fc3:
-                        max_changes = st.slider("Max changes", 0, 6, 3, step=1)
-
-                    with fc4:
-                        max_walk = st.slider("Max walking (min)", 0, 60, 20, step=5)
-
-                # Helper metrics for filtering/sorting
+                # Helper metrics for sorting display
                 def walking_minutes(j):
                     total = 0
                     for leg in (j.get("legs") or []):
@@ -543,22 +531,12 @@ if search_button:
                 def fare_pence(j):
                     return j.get("fare", {}).get("totalCost")  # may be None
 
-                # Apply FILTERS (client-side)
+                # Sort ALL journeys according to selection
                 journeys = data.get("journeys", [])
-                filtered = []
-                for j in journeys:
-                    if j.get("duration", 10**9) > max_duration:
-                        continue
-                    if journey_changes(j) > max_changes:
-                        continue
-                    if walking_minutes(j) > max_walk:
-                        continue
-                    filtered.append(j)
 
-                # Apply SORT
                 def sort_key(j):
-                    dur = j.get("duration", 10**9)
-                    chg = journey_changes(j)
+                    dur  = j.get("duration", 10**9)
+                    chg  = journey_changes(j)
                     walk = walking_minutes(j)
                     fare = fare_pence(j)
                     fare_sort = fare if isinstance(fare, int) else 10**9  # missing fare → last
@@ -570,25 +548,15 @@ if search_button:
                     # Fastest (default)
                     return (dur, chg, walk)
 
-                filtered.sort(key=sort_key)
+                sorted_journeys = sorted(journeys, key=sort_key)
 
-                # If everything was filtered out, show a friendly nudge
-                total = len(filtered)
-                if total == 0:
-                    st.warning("No routes match your filters. Try relaxing duration, changes, or walking limits.")
+                if not sorted_journeys:
+                    st.warning("No routes available for these inputs.")
                 else:
-                    results_to_show = st.slider(
-                        "Show top results",
-                        min_value=3,
-                        max_value=min(20, total),
-                        value=min(10, total),
-                        step=1,
-                        help="Number of sorted routes to display."
-                    )
-                    st.caption(f"Sorted by **{sort_option}** · Showing **{results_to_show}** of **{total}** routes")
+                    st.caption(f"Sorted by **{sort_option}** · Showing **{len(sorted_journeys)}** routes")
 
-                # ── Render journeys (respect filters/sorting and top-N) ─────────
-                for idx, journey in enumerate(filtered[:max(0, min(total, locals().get('results_to_show', 0)))], 1):
+                # ── Render journeys (all, in sorted order) ─────────────────────
+                for idx, journey in enumerate(sorted_journeys, 1):
                     with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins", expanded=(idx == 1)):
                         # Convert ISO strings (UTC) → London time for display
                         arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
@@ -602,9 +570,9 @@ if search_button:
                         with col2:
                             st.metric("🕐 Arrives", arr_uk.strftime("%H:%M"))
                         with col3:
-                            st.metric("🔄 Changes", max(len(journey.get('legs', [])) - 1, 0))
+                            st.metric("🔄 Changes", journey_changes(journey))
                         with col4:
-                            st.metric("🚶 Walking", f"{sum(leg.get('duration',0) for leg in journey.get('legs',[]) if leg.get('mode',{}).get('id')=='walking')} min")
+                            st.metric("🚶 Walking", f"{walking_minutes(journey)} min")
 
                         st.caption(f"Date: {dep_uk.strftime('%a, %d %b %Y')} (London)")
                         st.markdown("---")
