@@ -1,6 +1,6 @@
 # tfl_journey_planner.py
 # Streamlit TfL Journey Planner — friendly accessibility, robust selection, URL-encoding,
-# London-time handling for Arrive By / Depart At, and smart fallbacks.
+# London-time handling for Arrive By / Depart At, smart fallbacks, and graceful 404 handling.
 
 import streamlit as st
 import requests
@@ -358,7 +358,6 @@ with st.sidebar:
     time_option = st.radio("Travel time:", ["Leave now", "Arrive by", "Depart at"])
     st.session_state.journey_time_option = time_option
 
-    # Only show date/time pickers when needed
     if time_option != "Leave now":
         journey_date = st.date_input("Date:", uk_now.date(), key="jp_date")
         journey_time = st.time_input(
@@ -405,6 +404,32 @@ with st.sidebar:
 # ────────────────────────────────────────────────────────────────────────────────
 # Main: perform search
 # ────────────────────────────────────────────────────────────────────────────────
+def request_journeys(url, params):
+    """Call TfL JourneyResults and return (json, error_info). error_info is None on success."""
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 404:
+            # Gracefully handle the common 'No journey found'
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"message": "No journey found for your inputs."}
+            return None, {"status": 404, "message": err.get("message", "No journey found.")}
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.exceptions.HTTPError as e:
+        # Other HTTP errors: return structured info
+        try:
+            err_body = e.response.json()
+            msg = err_body.get("message") or e.response.text
+        except Exception:
+            msg = str(e)
+        return None, {"status": e.response.status_code if e.response else None, "message": msg}
+    except requests.exceptions.Timeout:
+        return None, {"status": "timeout", "message": "Request timed out."}
+    except Exception as e:
+        return None, {"status": "exception", "message": str(e)}
+
 if search_button:
     # Auto-resolve if the user typed but didn't click a suggestion
     if not st.session_state.origin_selected and st.session_state.origin_query:
@@ -416,125 +441,152 @@ if search_button:
         st.error("⚠️ Please select valid origin and destination (or choose from suggestions).")
     else:
         with st.spinner("Finding best routes..."):
-            try:
-                origin_loc = st.session_state.origin_selected
-                dest_loc = st.session_state.destination_selected
+            origin_loc = st.session_state.origin_selected
+            dest_loc = st.session_state.destination_selected
 
-                # Build origin/destination strings (prefer coordinates for accuracy)
-                origin_str = (
-                    f"{origin_loc['lat']},{origin_loc['lon']}"
-                    if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon")
-                    else origin_loc["name"]
-                )
-                dest_str = (
-                    f"{dest_loc['lat']},{dest_loc['lon']}"
-                    if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon")
-                    else dest_loc["name"]
-                )
+            # Build origin/destination strings (prefer coordinates for accuracy)
+            origin_str = (
+                f"{origin_loc['lat']},{origin_loc['lon']}"
+                if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon")
+                else origin_loc["name"]
+            )
+            dest_str = (
+                f"{dest_loc['lat']},{dest_loc['lon']}"
+                if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon")
+                else dest_loc["name"]
+            )
 
-                # URL-encode in case of special characters like "/"
-                origin_encoded = quote(origin_str, safe="")
-                dest_encoded = quote(dest_str, safe="")
+            # URL-encode in case of special characters like "/"
+            origin_encoded = quote(origin_str, safe="")
+            dest_encoded = quote(dest_str, safe="")
+            url = f"{TFL_BASE_URL}/Journey/JourneyResults/{origin_encoded}/to/{dest_encoded}"
 
-                url = f"{TFL_BASE_URL}/Journey/JourneyResults/{origin_encoded}/to/{dest_encoded}"
-                params = {
-                    "app_key": TFL_APP_KEY,
-                    "mode": ",".join(modes) if modes else "tube,walking",
+            # Base params
+            params = {
+                "app_key": TFL_APP_KEY,
+                "mode": ",".join(modes) if modes else "tube,walking",
+            }
+
+            # Time params (lowercase timeIs; limit search direction)
+            time_option = st.session_state.get("journey_time_option", "Leave now")
+            journey_datetime_uk = st.session_state.get("journey_datetime_uk")
+
+            if time_option == "Arrive by" and journey_datetime_uk:
+                params["timeIs"] = "arriving"  # must be lowercase
+                params["date"] = journey_datetime_uk.strftime("%Y%m%d")
+                params["time"] = journey_datetime_uk.strftime("%H%M")
+                params["calcOneDirection"] = "true"
+            elif time_option == "Depart at" and journey_datetime_uk:
+                params["timeIs"] = "departing"  # must be lowercase
+                params["date"] = journey_datetime_uk.strftime("%Y%m%d")
+                params["time"] = journey_datetime_uk.strftime("%H%M")
+                params["calcOneDirection"] = "true"
+            # else: Leave now → omit date/time to use current time
+
+            # Accessibility
+            selected_values = []
+            if accessibility_selected_labels:
+                ACCESSIBILITY_LABELS_TO_VALUES = {
+                    "No Requirements": "NoRequirements",
+                    "No Solid Stairs": "NoSolidStairs",
+                    "No Escalators": "NoEscalators",
+                    "No Elevators": "NoElevators",
+                    "Step-free to Vehicle": "StepFreeToVehicle",
+                    "Step-free to Platform": "StepFreeToPlatform",
                 }
+                selected_values = [ACCESSIBILITY_LABELS_TO_VALUES[l] for l in accessibility_selected_labels]
+                params["accessibilityPreference"] = ",".join(selected_values)
 
-                # Time params (lowercase timeIs; limit search direction)
-                time_option = st.session_state.get("journey_time_option", "Leave now")
-                journey_datetime_uk = st.session_state.get("journey_datetime_uk")
+            # First attempt
+            data, err = request_journeys(url, params)
 
-                if time_option == "Arrive by" and journey_datetime_uk:
-                    params["timeIs"] = "arriving"  # must be lowercase
-                    params["date"] = journey_datetime_uk.strftime("%Y%m%d")
-                    params["time"] = journey_datetime_uk.strftime("%H%M")
-                    params["calcOneDirection"] = "true"
-                elif time_option == "Depart at" and journey_datetime_uk:
-                    params["timeIs"] = "departing"  # must be lowercase
-                    params["date"] = journey_datetime_uk.strftime("%Y%m%d")
-                    params["time"] = journey_datetime_uk.strftime("%H%M")
-                    params["calcOneDirection"] = "true"
-                # else: Leave now → omit date/time to use current time
+            # If no journey found (404) and we had accessibility filters, retry once without them
+            relaxed = False
+            if err and err.get("status") == 404 and selected_values:
+                relaxed = True
+                params_relaxed = dict(params)
+                params_relaxed.pop("accessibilityPreference", None)
+                data, err = request_journeys(url, params_relaxed)
 
-                # Accessibility
-                if accessibility_selected_labels:
-                    selected_values = [ACCESSIBILITY_LABELS_TO_VALUES[l] for l in accessibility_selected_labels]
-                    params["accessibilityPreference"] = ",".join(selected_values)
+            # Present results / messages
+            if data and data.get("journeys"):
+                if relaxed:
+                    st.info("ℹ️ No journeys matched the accessibility filters, so I tried again without them and found options.")
+                st.success(f"✅ Found {len(data['journeys'])} route options")
+                st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
+                st.caption("🕒 All times below are shown in **London time**.")
 
-                resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                data = resp.json()
+                for idx, journey in enumerate(data["journeys"][:3], 1):
+                    with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins", expanded=(idx == 1)):
+                        # Convert ISO strings (UTC) → London time for display
+                        arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
+                        dep_utc = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
+                        arr_uk = arr_utc.astimezone(UK_TZ)
+                        dep_uk = dep_utc.astimezone(UK_TZ)
 
-                if data.get("journeys"):
-                    st.success(f"✅ Found {len(data['journeys'])} route options")
-                    st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
-                    st.caption("🕒 All times below are shown in **London time**.")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("⏱️ Duration", f"{journey['duration']} mins")
+                        with col2:
+                            st.metric("🕐 Arrives", arr_uk.strftime("%H:%M"))
+                        with col3:
+                            st.metric("🔄 Changes", max(len(journey.get('legs', [])) - 1, 0))
+                        with col4:
+                            st.metric("🚀 Departs", dep_uk.strftime("%H:%M"))
 
-                    for idx, journey in enumerate(data["journeys"][:3], 1):
-                        with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins", expanded=(idx == 1)):
-                            # Convert ISO strings (UTC) → London time for display
-                            arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
-                            dep_utc = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
-                            arr_uk = arr_utc.astimezone(UK_TZ)
-                            dep_uk = dep_utc.astimezone(UK_TZ)
+                        st.caption(f"Date: {dep_uk.strftime('%a, %d %b %Y')} (London)")
+                        st.markdown("---")
 
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                st.metric("⏱️ Duration", f"{journey['duration']} mins")
-                            with col2:
-                                st.metric("🕐 Arrives", arr_uk.strftime("%H:%M"))
-                            with col3:
-                                st.metric("🔄 Changes", max(len(journey.get('legs', [])) - 1, 0))
-                            with col4:
-                                st.metric("🚀 Departs", dep_uk.strftime("%H:%M"))
+                        for leg_idx, leg in enumerate(journey.get("legs", []), 1):
+                            mode_id = leg.get("mode", {}).get("id", "")
+                            mode_name = leg.get("mode", {}).get("name", "Unknown")
+                            mode_icons = {
+                                "tube": "🚇", "bus": "🚌", "walking": "🚶",
+                                "dlr": "🚊", "overground": "🚈",
+                                "elizabeth-line": "🚆", "national-rail": "🚂"
+                            }
+                            icon = mode_icons.get(mode_id, "🚉")
+                            st.markdown(f"### {icon} Step {leg_idx}: {mode_name.title()}")
 
-                            st.caption(f"Date: {dep_uk.strftime('%a, %d %b %Y')} (London)")
+                            if "departurePoint" in leg:
+                                st.write(f"**From:** {leg['departurePoint'].get('commonName', 'N/A')}")
+                            if "instruction" in leg:
+                                st.write(f"*{leg['instruction'].get('summary', '')}*")
+                            if leg.get("duration"):
+                                st.write(f"⏱️ {leg['duration']} minutes")
+                            if "arrivalPoint" in leg:
+                                st.write(f"**To:** {leg['arrivalPoint'].get('commonName', 'N/A')}")
 
+                            if leg_idx < len(journey.get("legs", [])):
+                                st.markdown("⬇️")
+
+                        if journey.get("fare", {}).get("totalCost") is not None:
                             st.markdown("---")
+                            st.markdown("### 💷 Fare")
+                            st.write(f"**Total:** £{journey['fare']['totalCost']/100:.2f}")
 
-                            for leg_idx, leg in enumerate(journey.get("legs", []), 1):
-                                mode_id = leg.get("mode", {}).get("id", "")
-                                mode_name = leg.get("mode", {}).get("name", "Unknown")
-                                mode_icons = {
-                                    "tube": "🚇", "bus": "🚌", "walking": "🚶",
-                                    "dlr": "🚊", "overground": "🚈",
-                                    "elizabeth-line": "🚆", "national-rail": "🚂"
-                                }
-                                icon = mode_icons.get(mode_id, "🚉")
-                                st.markdown(f"### {icon} Step {leg_idx}: {mode_name.title()}")
-
-                                if "departurePoint" in leg:
-                                    st.write(f"**From:** {leg['departurePoint'].get('commonName', 'N/A')}")
-                                if "instruction" in leg:
-                                    st.write(f"*{leg['instruction'].get('summary', '')}*")
-                                if leg.get("duration"):
-                                    st.write(f"⏱️ {leg['duration']} minutes")
-                                if "arrivalPoint" in leg:
-                                    st.write(f"**To:** {leg['arrivalPoint'].get('commonName', 'N/A')}")
-
-                                if leg_idx < len(journey.get("legs", [])):
-                                    st.markdown("⬇️")
-
-                            if journey.get("fare", {}).get("totalCost") is not None:
-                                st.markdown("---")
-                                st.markdown("### 💷 Fare")
-                                st.write(f"**Total:** £{journey['fare']['totalCost']/100:.2f}")
+            else:
+                # Friendly messaging on 404 / empty or other errors
+                if err and err.get("status") == 404:
+                    if relaxed:
+                        st.warning("⚠️ No journeys found even after relaxing accessibility filters.")
+                    else:
+                        st.warning("⚠️ No journeys found for your inputs.")
+                    with st.expander("Try these tips"):
+                        st.markdown(
+                            "- Pick nearby stations or landmarks instead of precise addresses\n"
+                            "- Adjust **time** (late night services may be limited)\n"
+                            "- Include more **modes** (e.g., bus / walking)\n"
+                            "- Remove **accessibility filters** if possible and try again\n"
+                            "- Check for planned closures or disruptions on lines"
+                        )
+                elif err:
+                    # Non-404 errors: show a concise message (no raw API dump by default)
+                    st.error(f"❌ Request failed ({err.get('status')}): {err.get('message')}")
+                    with st.expander("Technical details"):
+                        st.code(err.get("message", ""), language="text")
                 else:
                     st.warning("⚠️ No routes found. Try different locations or modes.")
-
-            except requests.exceptions.HTTPError as e:
-                st.error(f"❌ API Error: {e.response.status_code}")
-                with st.expander("Details"):
-                    try:
-                        st.code(e.response.text)
-                    except Exception:
-                        st.write("No error body available.")
-            except requests.exceptions.Timeout:
-                st.error("⏱️ Request timed out. Please try again.")
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
 
 else:
     st.info("👈 Enter journey details to get started")
