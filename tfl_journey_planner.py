@@ -1,6 +1,5 @@
 # tfl_journey_planner.py
-# Streamlit TfL Journey Planner — friendly accessibility, robust selection, URL-encoding,
-# London-time handling, graceful 404, and simple main-page sorting over all journeys.
+# Streamlit TfL Journey Planner — caching + sorting, London-time handling, accessibility, and user-friendly UI.
 
 import streamlit as st
 import requests
@@ -27,14 +26,12 @@ st.caption("🕒 Note: All times shown here refer to **London time (Europe/Londo
 # Helpers
 # ────────────────────────────────────────────────────────────────────────────────
 def is_postcode(text: str) -> bool:
-    """Check if text looks like a UK postcode."""
     if not text:
         return False
     pattern = r'^[A-Z]{1,2}[0-9][A-Z0-9]?\s?[0-9][A-Z]{2}$'
     return bool(re.match(pattern, text.upper().strip()))
 
 def geocode_address(address: str):
-    """Geocode address via OpenStreetMap (Nominatim). Returns selection-like dict or None."""
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": f"{address}, London, UK", "format": "json", "limit": 1}
@@ -59,7 +56,6 @@ def geocode_address(address: str):
     return None
 
 def search_locations(query: str):
-    """Search places via TfL 'Place/Search'."""
     if not query or len(query) < 3:
         return []
     try:
@@ -89,7 +85,6 @@ def search_locations(query: str):
         return []
 
 def search_stoppoints(query: str):
-    """Search stops via TfL 'StopPoint/Search'."""
     if not query or len(query) < 2:
         return []
     try:
@@ -119,7 +114,6 @@ def search_stoppoints(query: str):
         return []
 
 def resolve_location(query_text: str):
-    """Resolve free text into a selection-like dict. Prefers TfL matches, then geocode."""
     if not query_text:
         return None
     if is_postcode(query_text):
@@ -131,26 +125,26 @@ def resolve_location(query_text: str):
         return candidates[0]
     return geocode_address(query_text)
 
-# Safe way to programmatically change a text_input's value:
-# set *_pending, then rerun; on next run, apply pending BEFORE widget is created.
+# Safe programmatic text_input update: set *_pending, rerun; next run applies it BEFORE widget creation.
 def _select_origin(name: str, payload: dict):
     st.session_state.origin_selected = payload
     st.session_state.origin_query = name
     st.session_state.origin_input_pending = name
+    st.session_state.last_results = None  # clear cached results when selection changes
     st.rerun()
 
 def _select_destination(name: str, payload: dict):
     st.session_state.destination_selected = payload
     st.session_state.destination_query = name
     st.session_state.destination_input_pending = name
+    st.session_state.last_results = None  # clear cached results when selection changes
     st.rerun()
 
 def request_journeys(url, params):
-    """Call TfL JourneyResults and return (json, error_info). error_info is None on success."""
+    """Return (json, error_info). error_info is None on success."""
     try:
         resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 404:
-            # Gracefully handle the common 'No journey found'
             try:
                 err = resp.json()
             except Exception:
@@ -170,6 +164,21 @@ def request_journeys(url, params):
     except Exception as e:
         return None, {"status": "exception", "message": str(e)}
 
+# Small helpers used in sorting / UI metrics
+def walking_minutes(j):
+    total = 0
+    for leg in (j.get("legs") or []):
+        if leg.get("mode", {}).get("id") == "walking":
+            total += int(leg.get("duration", 0) or 0)
+    return total
+
+def journey_changes(j):
+    legs = j.get("legs", []) or []
+    return max(len(legs) - 1, 0)
+
+def fare_pence(j):
+    return j.get("fare", {}).get("totalCost")  # may be None
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Session state init
 # ────────────────────────────────────────────────────────────────────────────────
@@ -182,6 +191,8 @@ for key, default in [
     ("destination_input", ""),
     ("journey_time_option", "Leave now"),
     ("journey_datetime_uk", None),
+    ("sort_option", "Fastest"),
+    ("last_results", None),     # will store {"journeys": [...], "origin_loc": {...}, "dest_loc": {...}, "relaxed": bool, "generated_at": str}
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -213,6 +224,7 @@ with st.sidebar:
     # Auto-clear stale selection if user edits text
     if st.session_state.origin_selected and origin_input != st.session_state.origin_selected.get("name", ""):
         st.session_state.origin_selected = None
+        st.session_state.last_results = None
 
     if origin_input and len(origin_input) >= 2:
         if origin_input != st.session_state.origin_query:
@@ -285,6 +297,7 @@ with st.sidebar:
             st.session_state.origin_selected = None
             st.session_state.origin_query = ""
             st.session_state.origin_input_pending = ""   # clear via pending → safe
+            st.session_state.last_results = None
             st.rerun()
 
     st.markdown("---")
@@ -298,9 +311,9 @@ with st.sidebar:
         key="destination_input"
     )
 
-    # Auto-clear stale selection if user edits text
     if st.session_state.destination_selected and destination_input != st.session_state.destination_selected.get("name", ""):
         st.session_state.destination_selected = None
+        st.session_state.last_results = None
 
     if destination_input and len(destination_input) >= 2:
         if destination_input != st.session_state.destination_query:
@@ -309,7 +322,6 @@ with st.sidebar:
         with st.spinner("Searching..."):
             found_something = False
 
-            # Postcode quick-pick
             if is_postcode(destination_input):
                 found_something = True
                 st.markdown("**📮 Postcode:**")
@@ -324,7 +336,6 @@ with st.sidebar:
                         {"name": destination_input.upper(), "display": destination_input.upper(), "type": "Postcode", "use_coords": False},
                     )
 
-            # TfL suggestions
             place_suggestions = search_locations(destination_input)
             stop_suggestions = search_stoppoints(destination_input)
             all_suggestions = place_suggestions + stop_suggestions
@@ -348,7 +359,6 @@ with st.sidebar:
                     ):
                         _select_destination(suggestion["name"], suggestion)
 
-            # Geocode fallback
             if not is_postcode(destination_input):
                 geocoded = geocode_address(destination_input)
                 if geocoded:
@@ -372,6 +382,7 @@ with st.sidebar:
             st.session_state.destination_selected = None
             st.session_state.destination_query = ""
             st.session_state.destination_input_pending = ""  # clear via pending → safe
+            st.session_state.last_results = None
             st.rerun()
 
     st.markdown("---")
@@ -385,15 +396,8 @@ with st.sidebar:
 
     if time_option != "Leave now":
         journey_date = st.date_input("Date:", uk_now.date(), key="jp_date")
-        journey_time = st.time_input(
-            "Time:",
-            uk_now.time().replace(second=0, microsecond=0),
-            key="jp_time"
-        )
-        # Make a TZ-aware datetime in Europe/London
-        st.session_state.journey_datetime_uk = datetime.combine(
-            journey_date, journey_time, tzinfo=UK_TZ
-        )
+        journey_time = st.time_input("Time:", uk_now.time().replace(second=0, microsecond=0), key="jp_time")
+        st.session_state.journey_datetime_uk = datetime.combine(journey_date, journey_time, tzinfo=UK_TZ)
     else:
         st.session_state.journey_datetime_uk = None
 
@@ -405,7 +409,6 @@ with st.sidebar:
         default=["tube", "bus", "walking"]
     )
 
-    # Friendly Accessibility labels → TfL enum values
     ACCESSIBILITY_LABELS_TO_VALUES = {
         "No Requirements": "NoRequirements",
         "No Solid Stairs": "NoSolidStairs",
@@ -415,7 +418,6 @@ with st.sidebar:
         "Step-free to Platform": "StepFreeToPlatform",
     }
     ACCESSIBILITY_DISPLAY_ORDER = list(ACCESSIBILITY_LABELS_TO_VALUES.keys())
-
     accessibility_selected_labels = st.multiselect(
         "♿ Accessibility preferences:",
         ACCESSIBILITY_DISPLAY_ORDER,
@@ -427,7 +429,7 @@ with st.sidebar:
     search_button = st.button("🔍 Find Routes", type="primary", use_container_width=True)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Main: perform search
+# Fetch logic (only when user clicks)
 # ────────────────────────────────────────────────────────────────────────────────
 if search_button:
     # Auto-resolve if the user typed but didn't click a suggestion
@@ -443,55 +445,41 @@ if search_button:
             origin_loc = st.session_state.origin_selected
             dest_loc = st.session_state.destination_selected
 
-            # Build origin/destination strings (prefer coordinates for accuracy)
             origin_str = (
                 f"{origin_loc['lat']},{origin_loc['lon']}"
-                if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon")
-                else origin_loc["name"]
+                if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon") else origin_loc["name"]
             )
             dest_str = (
                 f"{dest_loc['lat']},{dest_loc['lon']}"
-                if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon")
-                else dest_loc["name"]
+                if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon") else dest_loc["name"]
             )
 
-            # URL-encode in case of special characters like "/"
             origin_encoded = quote(origin_str, safe="")
             dest_encoded = quote(dest_str, safe="")
             url = f"{TFL_BASE_URL}/Journey/JourneyResults/{origin_encoded}/to/{dest_encoded}"
 
-            # Base params
-            params = {
-                "app_key": TFL_APP_KEY,
-                "mode": ",".join(modes) if modes else "tube,walking",
-            }
+            params = {"app_key": TFL_APP_KEY, "mode": ",".join(modes) if modes else "tube,walking"}
 
-            # Time params (lowercase timeIs; limit search direction)
             time_option = st.session_state.get("journey_time_option", "Leave now")
             journey_datetime_uk = st.session_state.get("journey_datetime_uk")
-
             if time_option == "Arrive by" and journey_datetime_uk:
-                params["timeIs"] = "arriving"  # must be lowercase
+                params["timeIs"] = "arriving"
                 params["date"] = journey_datetime_uk.strftime("%Y%m%d")
                 params["time"] = journey_datetime_uk.strftime("%H%M")
                 params["calcOneDirection"] = "true"
             elif time_option == "Depart at" and journey_datetime_uk:
-                params["timeIs"] = "departing"  # must be lowercase
+                params["timeIs"] = "departing"
                 params["date"] = journey_datetime_uk.strftime("%Y%m%d")
                 params["time"] = journey_datetime_uk.strftime("%H%M")
                 params["calcOneDirection"] = "true"
-            # else: Leave now → omit date/time to use current time
 
-            # Accessibility
             selected_values = []
             if accessibility_selected_labels:
                 selected_values = [ACCESSIBILITY_LABELS_TO_VALUES[l] for l in accessibility_selected_labels]
                 params["accessibilityPreference"] = ",".join(selected_values)
 
-            # First attempt
             data, err = request_journeys(url, params)
 
-            # If no journey found (404) and we had accessibility filters, retry once without them
             relaxed = False
             if err and err.get("status") == 404 and selected_values:
                 relaxed = True
@@ -499,116 +487,21 @@ if search_button:
                 params_relaxed.pop("accessibilityPreference", None)
                 data, err = request_journeys(url, params_relaxed)
 
-            # Present results / messages
             if data and data.get("journeys"):
-                if relaxed:
-                    st.info("ℹ️ No journeys matched the accessibility filters, so I tried again without them and found options.")
-                st.success(f"✅ Found {len(data['journeys'])} route options")
-                st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
-                st.caption("🕒 All times below are shown in **London time**.")
-
-                # ── Simple sorting (MAIN PAGE) ──────────────────────────────────
-                with st.expander("🔎 Sort results", expanded=True):
-                    sort_option = st.radio(
-                        "Sort by",
-                        ["Fastest", "Cheapest", "Least Walking"],
-                        index=0,
-                        horizontal=True,
-                    )
-
-                # Helper metrics for sorting display
-                def walking_minutes(j):
-                    total = 0
-                    for leg in (j.get("legs") or []):
-                        if leg.get("mode", {}).get("id") == "walking":
-                            total += int(leg.get("duration", 0) or 0)
-                    return total
-
-                def journey_changes(j):
-                    legs = j.get("legs", []) or []
-                    return max(len(legs) - 1, 0)
-
-                def fare_pence(j):
-                    return j.get("fare", {}).get("totalCost")  # may be None
-
-                # Sort ALL journeys according to selection
-                journeys = data.get("journeys", [])
-
-                def sort_key(j):
-                    dur  = j.get("duration", 10**9)
-                    chg  = journey_changes(j)
-                    walk = walking_minutes(j)
-                    fare = fare_pence(j)
-                    fare_sort = fare if isinstance(fare, int) else 10**9  # missing fare → last
-
-                    if sort_option == "Cheapest":
-                        return (fare_sort, dur, chg, walk)
-                    if sort_option == "Least Walking":
-                        return (walk, dur, chg)
-                    # Fastest (default)
-                    return (dur, chg, walk)
-
-                sorted_journeys = sorted(journeys, key=sort_key)
-
-                if not sorted_journeys:
-                    st.warning("No routes available for these inputs.")
-                else:
-                    st.caption(f"Sorted by **{sort_option}** · Showing **{len(sorted_journeys)}** routes")
-
-                # ── Render journeys (all, in sorted order) ─────────────────────
-                for idx, journey in enumerate(sorted_journeys, 1):
-                    with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins", expanded=(idx == 1)):
-                        # Convert ISO strings (UTC) → London time for display
-                        arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
-                        dep_utc = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
-                        arr_uk = arr_utc.astimezone(UK_TZ)
-                        dep_uk = dep_utc.astimezone(UK_TZ)
-
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("⏱️ Duration", f"{journey['duration']} mins")
-                        with col2:
-                            st.metric("🕐 Arrives", arr_uk.strftime("%H:%M"))
-                        with col3:
-                            st.metric("🔄 Changes", journey_changes(journey))
-                        with col4:
-                            st.metric("🚶 Walking", f"{walking_minutes(journey)} min")
-
-                        st.caption(f"Date: {dep_uk.strftime('%a, %d %b %Y')} (London)")
-                        st.markdown("---")
-
-                        for leg_idx, leg in enumerate(journey.get("legs", []), 1):
-                            mode_id = leg.get("mode", {}).get("id", "")
-                            mode_name = leg.get("mode", {}).get("name", "Unknown")
-                            mode_icons = {
-                                "tube": "🚇", "bus": "🚌", "walking": "🚶",
-                                "dlr": "🚊", "overground": "🚈",
-                                "elizabeth-line": "🚆", "national-rail": "🚂"
-                            }
-                            icon = mode_icons.get(mode_id, "🚉")
-                            st.markdown(f"### {icon} Step {leg_idx}: {mode_name.title()}")
-
-                            if "departurePoint" in leg:
-                                st.write(f"**From:** {leg['departurePoint'].get('commonName', 'N/A')}")
-                            if "instruction" in leg:
-                                st.write(f"*{leg['instruction'].get('summary', '')}*")
-                            if leg.get("duration"):
-                                st.write(f"⏱️ {leg['duration']} minutes")
-                            if "arrivalPoint" in leg:
-                                st.write(f"**To:** {leg['arrivalPoint'].get('commonName', 'N/A')}")
-
-                            if leg_idx < len(journey.get("legs", [])):
-                                st.markdown("⬇️")
-
-                        if journey.get("fare", {}).get("totalCost") is not None:
-                            st.markdown("---")
-                            st.markdown("### 💷 Fare")
-                            st.write(f"**Total:** £{journey['fare']['totalCost']/100:.2f}")
-
+                # Cache results for sorting on reruns
+                st.session_state.last_results = {
+                    "journeys": data["journeys"],
+                    "origin_loc": origin_loc,
+                    "dest_loc": dest_loc,
+                    "relaxed": relaxed,
+                    "generated_at": datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M %Z"),
+                }
+                st.session_state.sort_option = st.session_state.get("sort_option", "Fastest")  # keep current choice
             else:
-                # Friendly messaging on 404 / empty or other errors
+                st.session_state.last_results = None
+                # Friendly messaging
                 if err and err.get("status") == 404:
-                    if locals().get("relaxed"):
+                    if relaxed:
                         st.warning("⚠️ No journeys found even after relaxing accessibility filters.")
                     else:
                         st.warning("⚠️ No journeys found for your inputs.")
@@ -627,9 +520,105 @@ if search_button:
                 else:
                     st.warning("⚠️ No routes found. Try different locations or modes.")
 
-else:
-    st.info("👈 Enter journey details to get started")
+# ────────────────────────────────────────────────────────────────────────────────
+# Results rendering (from cache so sorting is instant)
+# ────────────────────────────────────────────────────────────────────────────────
+cached = st.session_state.get("last_results")
+if cached and cached.get("journeys"):
+    origin_loc = cached["origin_loc"]
+    dest_loc = cached["dest_loc"]
+    relaxed = cached.get("relaxed", False)
+    journeys = cached["journeys"]
 
+    if relaxed:
+        st.info("ℹ️ No journeys matched the accessibility filters, so I tried again without them and found options.")
+    st.success(f"✅ Found {len(journeys)} route options")
+    st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
+    st.caption(f"🕒 All times below are in **London time** • Data generated at {cached.get('generated_at')}")
+
+    # Sorting control (persists via key so reruns don't reset)
+    with st.expander("🔎 Sort results", expanded=True):
+        st.radio(
+            "Sort by",
+            ["Fastest", "Cheapest", "Least Walking"],
+            index=0 if st.session_state.get("sort_option") not in ["Fastest", "Cheapest", "Least Walking"] else ["Fastest", "Cheapest", "Least Walking"].index(st.session_state.get("sort_option")),
+            horizontal=True,
+            key="sort_option"
+        )
+
+    # Prepare sorted journeys
+    def sort_key(j):
+        dur  = j.get("duration", 10**9)
+        chg  = journey_changes(j)
+        walk = walking_minutes(j)
+        fare = fare_pence(j)
+        fare_sort = fare if isinstance(fare, int) else 10**9  # missing fare → last
+        so = st.session_state.get("sort_option", "Fastest")
+        if so == "Cheapest":
+            return (fare_sort, dur, chg, walk)
+        if so == "Least Walking":
+            return (walk, dur, chg)
+        return (dur, chg, walk)  # Fastest
+
+    sorted_journeys = sorted(journeys, key=sort_key)
+    st.caption(f"Sorted by **{st.session_state.get('sort_option', 'Fastest')}** · Showing **{len(sorted_journeys)}** routes")
+
+    # Render all journeys in chosen order
+    for idx, journey in enumerate(sorted_journeys, 1):
+        # Fare for header
+        fp = fare_pence(journey)
+        fare_header = f"£{fp/100:.2f}" if isinstance(fp, int) else "-"
+
+        with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins • {fare_header}", expanded=(idx == 1)):
+            # Convert ISO strings (UTC) → London time for display
+            arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
+            dep_utc = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
+            arr_uk = arr_utc.astimezone(UK_TZ)
+            dep_uk = dep_utc.astimezone(UK_TZ)
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("⏱️ Duration", f"{journey['duration']} mins")
+            with col2:
+                st.metric("🕐 Arrives", arr_uk.strftime("%H:%M"))
+            with col3:
+                st.metric("🔄 Changes", journey_changes(journey))
+            with col4:
+                st.metric("🚶 Walking", f"{walking_minutes(journey)} min")
+
+            st.caption(f"Date: {dep_uk.strftime('%a, %d %b %Y')} (London)")
+            st.markdown("---")
+
+            for leg_idx, leg in enumerate(journey.get("legs", []), 1):
+                mode_id = leg.get("mode", {}).get("id", "")
+                mode_name = leg.get("mode", {}).get("name", "Unknown")
+                mode_icons = {"tube": "🚇", "bus": "🚌", "walking": "🚶", "dlr": "🚊", "overground": "🚈", "elizabeth-line": "🚆", "national-rail": "🚂"}
+                icon = mode_icons.get(mode_id, "🚉")
+                st.markdown(f"### {icon} Step {leg_idx}: {mode_name.title()}")
+
+                if "departurePoint" in leg:
+                    st.write(f"**From:** {leg['departurePoint'].get('commonName', 'N/A')}")
+                if "instruction" in leg:
+                    st.write(f"*{leg['instruction'].get('summary', '')}*")
+                if leg.get("duration"):
+                    st.write(f"⏱️ {leg['duration']} minutes")
+                if "arrivalPoint" in leg:
+                    st.write(f"**To:** {leg['arrivalPoint'].get('commonName', 'N/A')}")
+
+                if leg_idx < len(journey.get("legs", [])):
+                    st.markdown("⬇️")
+
+            # Fare section with friendly fallback
+            st.markdown("---")
+            st.markdown("### 💷 Fare")
+            if isinstance(fp, int):
+                st.write(f"**Total:** £{fp/100:.2f}")
+            else:
+                st.write("Fare Information Not Available")
+
+elif not search_button:
+    # Only show intro if no cached results
+    st.info("👈 Enter journey details to get started")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("""
