@@ -473,7 +473,7 @@ if cached and cached.get("journeys"):
     journeys = cached["journeys"]
 
     if relaxed:
-        st.info("ℹ️ No journeys matched the accessibility filters, so I tried again without them and found options.")
+        st.info("ℹ️ No journeys matched the accessibility filters, here are alternative journeys without accessibility filters:.")
     st.success(f"✅ Found {len(journeys)} route options")
     st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
     st.caption(f"🕒 All times below are in **London time** • Data generated at {cached.get('generated_at')}")
