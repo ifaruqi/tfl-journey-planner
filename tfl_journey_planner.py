@@ -1,6 +1,6 @@
 # tfl_journey_planner.py
 # Streamlit TfL Journey Planner — caching + reliable sorting, London-time handling,
-# accessibility, and user-friendly headers (Duration • Fare • Walking).
+# accessibility, URL-encoding, graceful 404, and user-friendly headers (Duration • Fare • Walking).
 
 import streamlit as st
 import requests
@@ -179,12 +179,6 @@ def journey_changes(j):
 
 def fare_pence(j):
     return j.get("fare", {}).get("totalCost")  # may be None
-
-def journey_key(j):
-    """Stable key for widgets: use timestamps to uniquely identify a journey."""
-    s = j.get("startDateTime", "")
-    a = j.get("arrivalDateTime", "")
-    return f"{s}__{a}"
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Session state init
@@ -445,7 +439,7 @@ if search_button:
                     "relaxed": relaxed,
                     "generated_at": datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M %Z"),
                 }
-                # keep current sort selection; default is Fastest
+                # keep current sort selection; default is already "Fastest"
             else:
                 st.session_state.last_results = None
                 if err and err.get("status") == 404:
@@ -484,7 +478,7 @@ if cached and cached.get("journeys"):
     st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
     st.caption(f"🕒 All times below are in **London time** • Data generated at {cached.get('generated_at')}")
 
-    # Sorting control (persistent via key; no 'index' arg so Streamlit respects session value)
+    # Sorting control (persistent via key; no index so Streamlit respects session value)
     sort_labels = ["Fastest", "Cheapest", "Least Walking"]
     st.radio("🔎 Sort results by", sort_labels, key="sort_option", horizontal=True)
 
@@ -505,17 +499,13 @@ if cached and cached.get("journeys"):
     sorted_journeys = sorted(journeys, key=sort_key)
     st.caption(f"Sorted by **{st.session_state.get('sort_option', 'Fastest')}** · Showing **{len(sorted_journeys)}** routes")
 
-    # Render all journeys in chosen order (stable expander keys ensure correct reordering)
+    # Render all journeys in chosen order
     for idx, journey in enumerate(sorted_journeys, 1):
-        # Fare + walking for header
         fp = fare_pence(journey)
         fare_header = f"£{fp/100:.2f}" if isinstance(fp, int) else "-"
         walk_header = f"Walking {walking_minutes(journey)} mins"
 
-        # Stable unique key so Streamlit doesn't reuse old expander positions
-        exp_key = f"route_{journey_key(journey)}"
-
-        with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins • {fare_header} • {walk_header}", expanded=(idx == 1), key=exp_key):
+        with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins • {fare_header} • {walk_header}", expanded=(idx == 1)):
             # Convert ISO strings (UTC) → London time for display
             arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
             dep_utc = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
