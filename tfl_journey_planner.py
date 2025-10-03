@@ -1,6 +1,6 @@
 # tfl_journey_planner.py
 # Streamlit TfL Journey Planner — friendly accessibility, robust selection, URL-encoding,
-# London-time handling for Arrive By / Depart At, smart fallbacks, and graceful 404 handling.
+# London-time handling, graceful 404, main-page filters/sorting, and "Show top N".
 
 import streamlit as st
 import requests
@@ -145,6 +145,31 @@ def _select_destination(name: str, payload: dict):
     st.session_state.destination_input_pending = name
     st.rerun()
 
+def request_journeys(url, params):
+    """Call TfL JourneyResults and return (json, error_info). error_info is None on success."""
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 404:
+            # Gracefully handle the common 'No journey found'
+            try:
+                err = resp.json()
+            except Exception:
+                err = {"message": "No journey found for your inputs."}
+            return None, {"status": 404, "message": err.get("message", "No journey found.")}
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.exceptions.HTTPError as e:
+        try:
+            err_body = e.response.json()
+            msg = err_body.get("message") or e.response.text
+        except Exception:
+            msg = str(e)
+        return None, {"status": e.response.status_code if e.response else None, "message": msg}
+    except requests.exceptions.Timeout:
+        return None, {"status": "timeout", "message": "Request timed out."}
+    except Exception as e:
+        return None, {"status": "exception", "message": str(e)}
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Session state init
 # ────────────────────────────────────────────────────────────────────────────────
@@ -228,9 +253,9 @@ with st.sidebar:
             if unique_suggestions:
                 found_something = True
                 st.markdown("**🚇 Stations & Places:**")
-                for idx, suggestion in enumerate(unique_suggestions[:6]):
+                for idx, suggestion in enumerate(unique_suggestions[:10]):
                     if st.button(
-                        f"{suggestion['display'][:60]}",
+                        f"{suggestion['display'][:70]}",
                         key=f"origin_sugg_{idx}",
                         use_container_width=True
                     ):
@@ -315,9 +340,9 @@ with st.sidebar:
             if unique_suggestions:
                 found_something = True
                 st.markdown("**🚇 Stations & Places:**")
-                for idx, suggestion in enumerate(unique_suggestions[:6]):
+                for idx, suggestion in enumerate(unique_suggestions[:10]):
                     if st.button(
-                        f"{suggestion['display'][:60]}",
+                        f"{suggestion['display'][:70]}",
                         key=f"dest_sugg_{idx}",
                         use_container_width=True
                     ):
@@ -404,32 +429,6 @@ with st.sidebar:
 # ────────────────────────────────────────────────────────────────────────────────
 # Main: perform search
 # ────────────────────────────────────────────────────────────────────────────────
-def request_journeys(url, params):
-    """Call TfL JourneyResults and return (json, error_info). error_info is None on success."""
-    try:
-        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 404:
-            # Gracefully handle the common 'No journey found'
-            try:
-                err = resp.json()
-            except Exception:
-                err = {"message": "No journey found for your inputs."}
-            return None, {"status": 404, "message": err.get("message", "No journey found.")}
-        resp.raise_for_status()
-        return resp.json(), None
-    except requests.exceptions.HTTPError as e:
-        # Other HTTP errors: return structured info
-        try:
-            err_body = e.response.json()
-            msg = err_body.get("message") or e.response.text
-        except Exception:
-            msg = str(e)
-        return None, {"status": e.response.status_code if e.response else None, "message": msg}
-    except requests.exceptions.Timeout:
-        return None, {"status": "timeout", "message": "Request timed out."}
-    except Exception as e:
-        return None, {"status": "exception", "message": str(e)}
-
 if search_button:
     # Auto-resolve if the user typed but didn't click a suggestion
     if not st.session_state.origin_selected and st.session_state.origin_query:
@@ -486,14 +485,6 @@ if search_button:
             # Accessibility
             selected_values = []
             if accessibility_selected_labels:
-                ACCESSIBILITY_LABELS_TO_VALUES = {
-                    "No Requirements": "NoRequirements",
-                    "No Solid Stairs": "NoSolidStairs",
-                    "No Escalators": "NoEscalators",
-                    "No Elevators": "NoElevators",
-                    "Step-free to Vehicle": "StepFreeToVehicle",
-                    "Step-free to Platform": "StepFreeToPlatform",
-                }
                 selected_values = [ACCESSIBILITY_LABELS_TO_VALUES[l] for l in accessibility_selected_labels]
                 params["accessibilityPreference"] = ",".join(selected_values)
 
@@ -511,12 +502,93 @@ if search_button:
             # Present results / messages
             if data and data.get("journeys"):
                 if relaxed:
-                    st.info("ℹ️ No journeys matched the accessibility filters, so here are the alternatives without the accessibility filters:")
+                    st.info("ℹ️ No journeys matched the accessibility filters, so I tried again without them and found options.")
                 st.success(f"✅ Found {len(data['journeys'])} route options")
                 st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
                 st.caption("🕒 All times below are shown in **London time**.")
 
-                for idx, journey in enumerate(data["journeys"][:3], 1):
+                # ── Result-level filters & sorting (MAIN PAGE) ──────────────────
+                with st.expander("🔎 Filter & sort results", expanded=True):
+                    fc1, fc2, fc3, fc4 = st.columns(4)
+
+                    with fc1:
+                        sort_option = st.radio(
+                            "Sort by",
+                            ["Fastest", "Cheapest", "Least Walking"],
+                            index=0,
+                            horizontal=True,
+                        )
+
+                    with fc2:
+                        max_duration = st.slider("Max duration (min)", 10, 180, 120, step=5)
+
+                    with fc3:
+                        max_changes = st.slider("Max changes", 0, 6, 3, step=1)
+
+                    with fc4:
+                        max_walk = st.slider("Max walking (min)", 0, 60, 20, step=5)
+
+                # Helper metrics for filtering/sorting
+                def walking_minutes(j):
+                    total = 0
+                    for leg in (j.get("legs") or []):
+                        if leg.get("mode", {}).get("id") == "walking":
+                            total += int(leg.get("duration", 0) or 0)
+                    return total
+
+                def journey_changes(j):
+                    legs = j.get("legs", []) or []
+                    return max(len(legs) - 1, 0)
+
+                def fare_pence(j):
+                    return j.get("fare", {}).get("totalCost")  # may be None
+
+                # Apply FILTERS (client-side)
+                journeys = data.get("journeys", [])
+                filtered = []
+                for j in journeys:
+                    if j.get("duration", 10**9) > max_duration:
+                        continue
+                    if journey_changes(j) > max_changes:
+                        continue
+                    if walking_minutes(j) > max_walk:
+                        continue
+                    filtered.append(j)
+
+                # Apply SORT
+                def sort_key(j):
+                    dur = j.get("duration", 10**9)
+                    chg = journey_changes(j)
+                    walk = walking_minutes(j)
+                    fare = fare_pence(j)
+                    fare_sort = fare if isinstance(fare, int) else 10**9  # missing fare → last
+
+                    if sort_option == "Cheapest":
+                        return (fare_sort, dur, chg, walk)
+                    if sort_option == "Least Walking":
+                        return (walk, dur, chg)
+                    # Fastest (default)
+                    return (dur, chg, walk)
+
+                filtered.sort(key=sort_key)
+
+                # If everything was filtered out, show a friendly nudge
+                total = len(filtered)
+                if total == 0:
+                    st.warning("No routes match your filters. Try relaxing duration, changes, or walking limits.")
+                else:
+                    results_to_show = st.slider(
+                        "Show top results",
+                        min_value=3,
+                        max_value=min(20, total),
+                        value=min(10, total),
+                        step=1,
+                        help="Number of sorted routes to display."
+                    )
+                    st.caption(f"Sorted by **{sort_option}** · Showing **{results_to_show}** of **{total}** routes")
+
+                # ── Render journeys (respect filters/sorting and top-N) ─────────
+                for idx, journey in enumerate(filtered[:max(0, min(total, locals().get('results_to_show', 0)))], 1):
                     with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins", expanded=(idx == 1)):
                         # Convert ISO strings (UTC) → London time for display
                         arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
@@ -532,7 +604,7 @@ if search_button:
                         with col3:
                             st.metric("🔄 Changes", max(len(journey.get('legs', [])) - 1, 0))
                         with col4:
-                            st.metric("🚀 Departs", dep_uk.strftime("%H:%M"))
+                            st.metric("🚶 Walking", f"{sum(leg.get('duration',0) for leg in journey.get('legs',[]) if leg.get('mode',{}).get('id')=='walking')} min")
 
                         st.caption(f"Date: {dep_uk.strftime('%a, %d %b %Y')} (London)")
                         st.markdown("---")
@@ -568,7 +640,7 @@ if search_button:
             else:
                 # Friendly messaging on 404 / empty or other errors
                 if err and err.get("status") == 404:
-                    if relaxed:
+                    if locals().get("relaxed"):
                         st.warning("⚠️ No journeys found even after relaxing accessibility filters.")
                     else:
                         st.warning("⚠️ No journeys found for your inputs.")
@@ -581,7 +653,6 @@ if search_button:
                             "- Check for planned closures or disruptions on lines"
                         )
                 elif err:
-                    # Non-404 errors: show a concise message (no raw API dump by default)
                     st.error(f"❌ Request failed ({err.get('status')}): {err.get('message')}")
                     with st.expander("Technical details"):
                         st.code(err.get("message", ""), language="text")
