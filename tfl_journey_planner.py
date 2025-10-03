@@ -511,7 +511,7 @@ if search_button:
             # Present results / messages
             if data and data.get("journeys"):
                 if relaxed:
-                    st.info("ℹ️ No journeys matched the accessibility filters, so I tried again without them and found options.")
+                    st.info("ℹ️ No journeys matched the accessibility filters, so here are the alternatives without the accessibility filters:")
                 st.success(f"✅ Found {len(data['journeys'])} route options")
                 st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
                 st.caption("🕒 All times below are shown in **London time**.")
