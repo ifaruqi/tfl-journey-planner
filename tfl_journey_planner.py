@@ -1,10 +1,11 @@
 # tfl_journey_planner.py
-# Streamlit TfL Journey Planner — friendly accessibility, robust selection, URL-encoding, smart fallbacks
-# Fix for widget state: use *_pending pattern to update text inputs safely.
+# Streamlit TfL Journey Planner — friendly accessibility, robust selection, URL-encoding,
+# London-time handling for Arrive By / Depart At, and smart fallbacks.
 
 import streamlit as st
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import os
 import re
 from urllib.parse import quote
@@ -15,10 +16,12 @@ from urllib.parse import quote
 TFL_APP_KEY = os.environ.get("TFL_APP_KEY", "your_app_key_here")
 TFL_BASE_URL = "https://api.tfl.gov.uk"
 REQUEST_TIMEOUT = 10
+UK_TZ = ZoneInfo("Europe/London")
 
 st.set_page_config(page_title="TfL Journey Planner", page_icon="🚇", layout="wide")
 st.title("🚇 Transport for London Journey Planner")
 st.markdown("Plan your journey across London using real-time TfL data")
+st.caption("🕒 Note: All times shown here refer to **London time (Europe/London)**.")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -152,6 +155,8 @@ for key, default in [
     ("destination_query", ""),
     ("origin_input", ""),
     ("destination_input", ""),
+    ("journey_time_option", "Leave now"),
+    ("journey_datetime_uk", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -346,13 +351,27 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Time ────────────────────────────────────────────────────────────────────
+    # ── Time (Europe/London) ────────────────────────────────────────────────────
     st.subheader("🕐 When?")
+    uk_now = datetime.now(UK_TZ)
+
     time_option = st.radio("Travel time:", ["Leave now", "Arrive by", "Depart at"])
+    st.session_state.journey_time_option = time_option
+
+    # Only show date/time pickers when needed
     if time_option != "Leave now":
-        journey_date = st.date_input("Date:", datetime.now())
-        journey_time = st.time_input("Time:", datetime.now().time())
-        journey_datetime = datetime.combine(journey_date, journey_time)
+        journey_date = st.date_input("Date:", uk_now.date(), key="jp_date")
+        journey_time = st.time_input(
+            "Time:",
+            uk_now.time().replace(second=0, microsecond=0),
+            key="jp_time"
+        )
+        # Make a TZ-aware datetime in Europe/London
+        st.session_state.journey_datetime_uk = datetime.combine(
+            journey_date, journey_time, tzinfo=UK_TZ
+        )
+    else:
+        st.session_state.journey_datetime_uk = None
 
     # ── Preferences ─────────────────────────────────────────────────────────────
     st.subheader("⚙️ Preferences")
@@ -402,25 +421,44 @@ if search_button:
                 dest_loc = st.session_state.destination_selected
 
                 # Build origin/destination strings (prefer coordinates for accuracy)
-                origin_str = f"{origin_loc['lat']},{origin_loc['lon']}" if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon") else origin_loc["name"]
-                dest_str = f"{dest_loc['lat']},{dest_loc['lon']}" if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon") else dest_loc["name"]
+                origin_str = (
+                    f"{origin_loc['lat']},{origin_loc['lon']}"
+                    if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon")
+                    else origin_loc["name"]
+                )
+                dest_str = (
+                    f"{dest_loc['lat']},{dest_loc['lon']}"
+                    if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon")
+                    else dest_loc["name"]
+                )
 
                 # URL-encode in case of special characters like "/"
                 origin_encoded = quote(origin_str, safe="")
                 dest_encoded = quote(dest_str, safe="")
 
                 url = f"{TFL_BASE_URL}/Journey/JourneyResults/{origin_encoded}/to/{dest_encoded}"
-                params = {"app_key": TFL_APP_KEY, "mode": ",".join(modes) if modes else "tube,walking"}
+                params = {
+                    "app_key": TFL_APP_KEY,
+                    "mode": ",".join(modes) if modes else "tube,walking",
+                }
 
-                if 'time_option' in locals() and time_option == "Arrive by":
-                    params["timeIs"] = "Arriving"
-                    params["date"] = journey_datetime.strftime("%Y%m%d")
-                    params["time"] = journey_datetime.strftime("%H%M")
-                elif 'time_option' in locals() and time_option == "Depart at":
-                    params["timeIs"] = "Departing"
-                    params["date"] = journey_datetime.strftime("%Y%m%d")
-                    params["time"] = journey_datetime.strftime("%H%M")
+                # Time params (lowercase timeIs; limit search direction)
+                time_option = st.session_state.get("journey_time_option", "Leave now")
+                journey_datetime_uk = st.session_state.get("journey_datetime_uk")
 
+                if time_option == "Arrive by" and journey_datetime_uk:
+                    params["timeIs"] = "arriving"  # must be lowercase
+                    params["date"] = journey_datetime_uk.strftime("%Y%m%d")
+                    params["time"] = journey_datetime_uk.strftime("%H%M")
+                    params["calcOneDirection"] = "true"
+                elif time_option == "Depart at" and journey_datetime_uk:
+                    params["timeIs"] = "departing"  # must be lowercase
+                    params["date"] = journey_datetime_uk.strftime("%Y%m%d")
+                    params["time"] = journey_datetime_uk.strftime("%H%M")
+                    params["calcOneDirection"] = "true"
+                # else: Leave now → omit date/time to use current time
+
+                # Accessibility
                 if accessibility_selected_labels:
                     selected_values = [ACCESSIBILITY_LABELS_TO_VALUES[l] for l in accessibility_selected_labels]
                     params["accessibilityPreference"] = ",".join(selected_values)
@@ -432,20 +470,27 @@ if search_button:
                 if data.get("journeys"):
                     st.success(f"✅ Found {len(data['journeys'])} route options")
                     st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
+                    st.caption("🕒 All times below are shown in **London time**.")
 
                     for idx, journey in enumerate(data["journeys"][:3], 1):
                         with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins", expanded=(idx == 1)):
+                            # Convert ISO strings (UTC) → London time for display
+                            arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
+                            dep_utc = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
+                            arr_uk = arr_utc.astimezone(UK_TZ)
+                            dep_uk = dep_utc.astimezone(UK_TZ)
+
                             col1, col2, col3, col4 = st.columns(4)
                             with col1:
                                 st.metric("⏱️ Duration", f"{journey['duration']} mins")
                             with col2:
-                                arrival = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
-                                st.metric("🕐 Arrives", arrival.strftime("%H:%M"))
+                                st.metric("🕐 Arrives", arr_uk.strftime("%H:%M"))
                             with col3:
                                 st.metric("🔄 Changes", max(len(journey.get('legs', [])) - 1, 0))
                             with col4:
-                                departure = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
-                                st.metric("🚀 Departs", departure.strftime("%H:%M"))
+                                st.metric("🚀 Departs", dep_uk.strftime("%H:%M"))
+
+                            st.caption(f"Date: {dep_uk.strftime('%a, %d %b %Y')} (London)")
 
                             st.markdown("---")
 
@@ -517,4 +562,4 @@ else:
     st.caption("Get your TfL API key at: https://api-portal.tfl.gov.uk/")
 
 st.markdown("---")
-st.caption("Powered by TfL Unified API")
+st.caption("Powered by TfL Unified API • All times shown are London time (Europe/London).")
