@@ -1,8 +1,13 @@
+# Add this at the top with other imports
+from urllib.parse import quote
+
+# Then find the journey search section and update it
 app_code = '''import streamlit as st
 import requests
 from datetime import datetime, timedelta
 import os
 import re
+from urllib.parse import quote
 
 # TfL API Configuration
 TFL_APP_KEY = os.environ.get("TFL_APP_KEY", "your_app_key_here")
@@ -16,7 +21,7 @@ def is_postcode(text):
     return bool(re.match(pattern, text.upper().strip()))
 
 def geocode_address(address):
-    """Geocode addresses using OpenStreetMap (for non-postcode addresses)"""
+    """Geocode addresses using OpenStreetMap"""
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {
@@ -64,15 +69,17 @@ def search_locations(query):
         for place in results:
             name = place.get('name', '')
             place_type = place.get('placeType', '')
+            lat = place.get('lat')
+            lon = place.get('lon')
             
             suggestions.append({
                 'display': f"{name} ({place_type})" if place_type else name,
                 'name': name,
                 'type': place_type,
-                'lat': place.get('lat'),
-                'lon': place.get('lon'),
+                'lat': lat,
+                'lon': lon,
                 'id': place.get('id', ''),
-                'use_coords': False  # Use name directly for TfL places
+                'use_coords': bool(lat and lon)  # Use coords if available for better accuracy
             })
         
         return suggestions
@@ -100,15 +107,17 @@ def search_stoppoints(query):
             for match in data['matches']:
                 name = match.get('name', '')
                 modes = ', '.join(match.get('modes', []))
+                lat = match.get('lat')
+                lon = match.get('lon')
                 
                 suggestions.append({
                     'display': f"{name} [{modes}]",
                     'name': name,
                     'type': 'Stop',
-                    'lat': match.get('lat'),
-                    'lon': match.get('lon'),
+                    'lat': lat,
+                    'lon': lon,
                     'id': match.get('id', ''),
-                    'use_coords': False  # Use name for stops
+                    'use_coords': bool(lat and lon)
                 })
         
         return suggestions
@@ -148,7 +157,7 @@ with st.sidebar:
             with st.spinner("Searching..."):
                 found_something = False
                 
-                # Check if it's a postcode - if so, create direct entry
+                # Check if it's a postcode
                 if is_postcode(origin_input):
                     found_something = True
                     st.markdown("**📮 Postcode:**")
@@ -162,12 +171,12 @@ with st.sidebar:
                             'name': origin_input.upper(),
                             'display': origin_input.upper(),
                             'type': 'Postcode',
-                            'use_coords': False  # Pass postcode directly to API
+                            'use_coords': False
                         }
                         st.session_state.origin_query = origin_input
                         st.rerun()
                 
-                # Search TfL stations and places
+                # Search TfL
                 place_suggestions = search_locations(origin_input)
                 stop_suggestions = search_stoppoints(origin_input)
                 
@@ -192,7 +201,7 @@ with st.sidebar:
                             st.session_state.origin_query = suggestion['name']
                             st.rerun()
                 
-                # Geocode as fallback (for street addresses)
+                # Geocode fallback
                 if not is_postcode(origin_input):
                     geocoded = geocode_address(origin_input)
                     if geocoded:
@@ -339,7 +348,7 @@ if search_button:
                 origin_loc = st.session_state.origin_selected
                 dest_loc = st.session_state.destination_selected
                 
-                # Use name directly for postcodes and TfL places, coordinates for geocoded addresses
+                # Determine what to use: coordinates or name
                 if origin_loc.get('use_coords') and origin_loc.get('lat') and origin_loc.get('lon'):
                     origin_str = f"{origin_loc['lat']},{origin_loc['lon']}"
                 else:
@@ -350,7 +359,11 @@ if search_button:
                 else:
                     dest_str = dest_loc['name']
                 
-                url = f"{TFL_BASE_URL}/Journey/JourneyResults/{origin_str}/to/{dest_str}"
+                # URL encode to handle special characters like /
+                origin_encoded = quote(origin_str, safe='')
+                dest_encoded = quote(dest_str, safe='')
+                
+                url = f"{TFL_BASE_URL}/Journey/JourneyResults/{origin_encoded}/to/{dest_encoded}"
                 
                 params = {"app_key": TFL_APP_KEY, "mode": ",".join(modes)}
                 
@@ -463,7 +476,5 @@ st.caption("Powered by TfL Unified API")
 with open('tfl_journey_planner.py', 'w', encoding='utf-8') as f:
     f.write(app_code)
 
-print("✅ OPTIMIZED VERSION - Postcodes work directly!")
-print("📮 Postcodes: Passed directly to Journey API")
-print("🚇 Stations: Use TfL names")
-print("🗺️ Addresses: Use geocoded coordinates")
+print("✅ FIXED - URL encoding added!")
+print("Now handles special characters like / in place names")
