@@ -1,5 +1,6 @@
 # tfl_journey_planner.py
-# Streamlit TfL Journey Planner — caching + sorting, London-time handling, accessibility, and user-friendly UI.
+# Streamlit TfL Journey Planner — caching + reliable sorting, London-time handling,
+# accessibility, and user-friendly headers (Duration • Fare • Walking).
 
 import streamlit as st
 import requests
@@ -125,19 +126,19 @@ def resolve_location(query_text: str):
         return candidates[0]
     return geocode_address(query_text)
 
-# Safe programmatic text_input update: set *_pending, rerun; next run applies it BEFORE widget creation.
+# Safe programmatic text_input update: set *_pending, rerun; next run applies BEFORE widget creation.
 def _select_origin(name: str, payload: dict):
     st.session_state.origin_selected = payload
     st.session_state.origin_query = name
     st.session_state.origin_input_pending = name
-    st.session_state.last_results = None  # clear cached results when selection changes
+    st.session_state.last_results = None
     st.rerun()
 
 def _select_destination(name: str, payload: dict):
     st.session_state.destination_selected = payload
     st.session_state.destination_query = name
     st.session_state.destination_input_pending = name
-    st.session_state.last_results = None  # clear cached results when selection changes
+    st.session_state.last_results = None
     st.rerun()
 
 def request_journeys(url, params):
@@ -179,6 +180,12 @@ def journey_changes(j):
 def fare_pence(j):
     return j.get("fare", {}).get("totalCost")  # may be None
 
+def journey_key(j):
+    """Stable key for widgets: use timestamps to uniquely identify a journey."""
+    s = j.get("startDateTime", "")
+    a = j.get("arrivalDateTime", "")
+    return f"{s}__{a}"
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Session state init
 # ────────────────────────────────────────────────────────────────────────────────
@@ -192,7 +199,7 @@ for key, default in [
     ("journey_time_option", "Leave now"),
     ("journey_datetime_uk", None),
     ("sort_option", "Fastest"),
-    ("last_results", None),     # will store {"journeys": [...], "origin_loc": {...}, "dest_loc": {...}, "relaxed": bool, "generated_at": str}
+    ("last_results", None),   # {"journeys": [...], "origin_loc": {...}, "dest_loc": {...}, "relaxed": bool, "generated_at": str}
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -212,7 +219,7 @@ if "destination_input_pending" in st.session_state:
 with st.sidebar:
     st.header("Journey Details")
 
-    # ── Origin ──────────────────────────────────────────────────────────────────
+    # ── Origin
     st.subheader("📍 From")
     origin_input = st.text_input(
         "Origin:",
@@ -220,8 +227,6 @@ with st.sidebar:
         placeholder="Station, postcode, or address",
         key="origin_input"
     )
-
-    # Auto-clear stale selection if user edits text
     if st.session_state.origin_selected and origin_input != st.session_state.origin_selected.get("name", ""):
         st.session_state.origin_selected = None
         st.session_state.last_results = None
@@ -229,62 +234,37 @@ with st.sidebar:
     if origin_input and len(origin_input) >= 2:
         if origin_input != st.session_state.origin_query:
             st.session_state.origin_query = origin_input
-
         with st.spinner("Searching..."):
             found_something = False
 
-            # Postcode quick-pick
             if is_postcode(origin_input):
                 found_something = True
                 st.markdown("**📮 Postcode:**")
-                if st.button(
-                    f"📍 {origin_input.upper()}",
-                    key="origin_postcode",
-                    use_container_width=True,
-                    type="primary"
-                ):
-                    _select_origin(
-                        origin_input.upper(),
-                        {"name": origin_input.upper(), "display": origin_input.upper(), "type": "Postcode", "use_coords": False},
-                    )
+                if st.button(f"📍 {origin_input.upper()}", key="origin_postcode", use_container_width=True, type="primary"):
+                    _select_origin(origin_input.upper(), {"name": origin_input.upper(), "display": origin_input.upper(), "type": "Postcode", "use_coords": False})
 
-            # TfL suggestions (Place + StopPoint)
             place_suggestions = search_locations(origin_input)
             stop_suggestions = search_stoppoints(origin_input)
             all_suggestions = place_suggestions + stop_suggestions
-
-            # Deduplicate by name while keeping first occurrence
-            seen = set()
-            unique_suggestions = []
+            seen = set(); unique_suggestions = []
             for s in all_suggestions:
                 n = s.get("name", "")
                 if n and n not in seen:
-                    seen.add(n)
-                    unique_suggestions.append(s)
+                    seen.add(n); unique_suggestions.append(s)
 
             if unique_suggestions:
                 found_something = True
                 st.markdown("**🚇 Stations & Places:**")
                 for idx, suggestion in enumerate(unique_suggestions[:10]):
-                    if st.button(
-                        f"{suggestion['display'][:70]}",
-                        key=f"origin_sugg_{idx}",
-                        use_container_width=True
-                    ):
+                    if st.button(f"{suggestion['display'][:70]}", key=f"origin_sugg_{idx}", use_container_width=True):
                         _select_origin(suggestion["name"], suggestion)
 
-            # Geocode fallback (if not a postcode)
             if not is_postcode(origin_input):
                 geocoded = geocode_address(origin_input)
                 if geocoded:
                     found_something = True
                     st.markdown("**🗺️ Address:**")
-                    if st.button(
-                        f"📍 {geocoded['display'][:80]}",
-                        key="origin_geocoded",
-                        use_container_width=True,
-                        type="secondary"
-                    ):
+                    if st.button(f"📍 {geocoded['display'][:80]}", key="origin_geocoded", use_container_width=True, type="secondary"):
                         _select_origin(origin_input, geocoded)
 
             if not found_something:
@@ -296,13 +276,13 @@ with st.sidebar:
         if st.button("❌ Clear", key="clear_origin", use_container_width=True):
             st.session_state.origin_selected = None
             st.session_state.origin_query = ""
-            st.session_state.origin_input_pending = ""   # clear via pending → safe
+            st.session_state.origin_input_pending = ""
             st.session_state.last_results = None
             st.rerun()
 
     st.markdown("---")
 
-    # ── Destination ─────────────────────────────────────────────────────────────
+    # ── Destination
     st.subheader("📍 To")
     destination_input = st.text_input(
         "Destination:",
@@ -310,7 +290,6 @@ with st.sidebar:
         placeholder="Station, postcode, or address",
         key="destination_input"
     )
-
     if st.session_state.destination_selected and destination_input != st.session_state.destination_selected.get("name", ""):
         st.session_state.destination_selected = None
         st.session_state.last_results = None
@@ -318,45 +297,29 @@ with st.sidebar:
     if destination_input and len(destination_input) >= 2:
         if destination_input != st.session_state.destination_query:
             st.session_state.destination_query = destination_input
-
         with st.spinner("Searching..."):
             found_something = False
 
             if is_postcode(destination_input):
                 found_something = True
                 st.markdown("**📮 Postcode:**")
-                if st.button(
-                    f"📍 {destination_input.upper()}",
-                    key="dest_postcode",
-                    use_container_width=True,
-                    type="primary"
-                ):
-                    _select_destination(
-                        destination_input.upper(),
-                        {"name": destination_input.upper(), "display": destination_input.upper(), "type": "Postcode", "use_coords": False},
-                    )
+                if st.button(f"📍 {destination_input.upper()}", key="dest_postcode", use_container_width=True, type="primary"):
+                    _select_destination(destination_input.upper(), {"name": destination_input.upper(), "display": destination_input.upper(), "type": "Postcode", "use_coords": False})
 
             place_suggestions = search_locations(destination_input)
             stop_suggestions = search_stoppoints(destination_input)
             all_suggestions = place_suggestions + stop_suggestions
-
-            seen = set()
-            unique_suggestions = []
+            seen = set(); unique_suggestions = []
             for s in all_suggestions:
                 n = s.get("name", "")
                 if n and n not in seen:
-                    seen.add(n)
-                    unique_suggestions.append(s)
+                    seen.add(n); unique_suggestions.append(s)
 
             if unique_suggestions:
                 found_something = True
                 st.markdown("**🚇 Stations & Places:**")
                 for idx, suggestion in enumerate(unique_suggestions[:10]):
-                    if st.button(
-                        f"{suggestion['display'][:70]}",
-                        key=f"dest_sugg_{idx}",
-                        use_container_width=True
-                    ):
+                    if st.button(f"{suggestion['display'][:70]}", key=f"dest_sugg_{idx}", use_container_width=True):
                         _select_destination(suggestion["name"], suggestion)
 
             if not is_postcode(destination_input):
@@ -364,12 +327,7 @@ with st.sidebar:
                 if geocoded:
                     found_something = True
                     st.markdown("**🗺️ Address:**")
-                    if st.button(
-                        f"📍 {geocoded['display'][:80]}",
-                        key="dest_geocoded",
-                        use_container_width=True,
-                        type="secondary"
-                    ):
+                    if st.button(f"📍 {geocoded['display'][:80]}", key="dest_geocoded", use_container_width=True, type="secondary"):
                         _select_destination(destination_input, geocoded)
 
             if not found_something:
@@ -381,16 +339,15 @@ with st.sidebar:
         if st.button("❌ Clear", key="clear_dest", use_container_width=True):
             st.session_state.destination_selected = None
             st.session_state.destination_query = ""
-            st.session_state.destination_input_pending = ""  # clear via pending → safe
+            st.session_state.destination_input_pending = ""
             st.session_state.last_results = None
             st.rerun()
 
     st.markdown("---")
 
-    # ── Time (Europe/London) ────────────────────────────────────────────────────
+    # ── Time (Europe/London)
     st.subheader("🕐 When?")
     uk_now = datetime.now(UK_TZ)
-
     time_option = st.radio("Travel time:", ["Leave now", "Arrive by", "Depart at"])
     st.session_state.journey_time_option = time_option
 
@@ -401,14 +358,13 @@ with st.sidebar:
     else:
         st.session_state.journey_datetime_uk = None
 
-    # ── Preferences ─────────────────────────────────────────────────────────────
+    # ── Preferences
     st.subheader("⚙️ Preferences")
     modes = st.multiselect(
         "Transport modes:",
         ["tube", "bus", "dlr", "overground", "elizabeth-line", "national-rail", "walking"],
         default=["tube", "bus", "walking"]
     )
-
     ACCESSIBILITY_LABELS_TO_VALUES = {
         "No Requirements": "NoRequirements",
         "No Solid Stairs": "NoSolidStairs",
@@ -445,14 +401,8 @@ if search_button:
             origin_loc = st.session_state.origin_selected
             dest_loc = st.session_state.destination_selected
 
-            origin_str = (
-                f"{origin_loc['lat']},{origin_loc['lon']}"
-                if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon") else origin_loc["name"]
-            )
-            dest_str = (
-                f"{dest_loc['lat']},{dest_loc['lon']}"
-                if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon") else dest_loc["name"]
-            )
+            origin_str = f"{origin_loc['lat']},{origin_loc['lon']}" if origin_loc.get("use_coords") and origin_loc.get("lat") and origin_loc.get("lon") else origin_loc["name"]
+            dest_str = f"{dest_loc['lat']},{dest_loc['lon']}" if dest_loc.get("use_coords") and dest_loc.get("lat") and dest_loc.get("lon") else dest_loc["name"]
 
             origin_encoded = quote(origin_str, safe="")
             dest_encoded = quote(dest_str, safe="")
@@ -488,7 +438,6 @@ if search_button:
                 data, err = request_journeys(url, params_relaxed)
 
             if data and data.get("journeys"):
-                # Cache results for sorting on reruns
                 st.session_state.last_results = {
                     "journeys": data["journeys"],
                     "origin_loc": origin_loc,
@@ -496,10 +445,9 @@ if search_button:
                     "relaxed": relaxed,
                     "generated_at": datetime.now(UK_TZ).strftime("%Y-%m-%d %H:%M %Z"),
                 }
-                st.session_state.sort_option = st.session_state.get("sort_option", "Fastest")  # keep current choice
+                # keep current sort selection; default is Fastest
             else:
                 st.session_state.last_results = None
-                # Friendly messaging
                 if err and err.get("status") == 404:
                     if relaxed:
                         st.warning("⚠️ No journeys found even after relaxing accessibility filters.")
@@ -536,15 +484,9 @@ if cached and cached.get("journeys"):
     st.markdown(f"### From: **{origin_loc['name']}** → To: **{dest_loc['name']}**")
     st.caption(f"🕒 All times below are in **London time** • Data generated at {cached.get('generated_at')}")
 
-    # Sorting control (persists via key so reruns don't reset)
-    with st.expander("🔎 Sort results", expanded=True):
-        st.radio(
-            "Sort by",
-            ["Fastest", "Cheapest", "Least Walking"],
-            index=0 if st.session_state.get("sort_option") not in ["Fastest", "Cheapest", "Least Walking"] else ["Fastest", "Cheapest", "Least Walking"].index(st.session_state.get("sort_option")),
-            horizontal=True,
-            key="sort_option"
-        )
+    # Sorting control (persistent via key; no 'index' arg so Streamlit respects session value)
+    sort_labels = ["Fastest", "Cheapest", "Least Walking"]
+    st.radio("🔎 Sort results by", sort_labels, key="sort_option", horizontal=True)
 
     # Prepare sorted journeys
     def sort_key(j):
@@ -563,13 +505,17 @@ if cached and cached.get("journeys"):
     sorted_journeys = sorted(journeys, key=sort_key)
     st.caption(f"Sorted by **{st.session_state.get('sort_option', 'Fastest')}** · Showing **{len(sorted_journeys)}** routes")
 
-    # Render all journeys in chosen order
+    # Render all journeys in chosen order (stable expander keys ensure correct reordering)
     for idx, journey in enumerate(sorted_journeys, 1):
-        # Fare for header
+        # Fare + walking for header
         fp = fare_pence(journey)
         fare_header = f"£{fp/100:.2f}" if isinstance(fp, int) else "-"
+        walk_header = f"Walking {walking_minutes(journey)} mins"
 
-        with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins • {fare_header}", expanded=(idx == 1)):
+        # Stable unique key so Streamlit doesn't reuse old expander positions
+        exp_key = f"route_{journey_key(journey)}"
+
+        with st.expander(f"🗺️ Route {idx} – {journey['duration']} mins • {fare_header} • {walk_header}", expanded=(idx == 1), key=exp_key):
             # Convert ISO strings (UTC) → London time for display
             arr_utc = datetime.fromisoformat(journey['arrivalDateTime'].replace('Z', '+00:00'))
             dep_utc = datetime.fromisoformat(journey['startDateTime'].replace('Z', '+00:00'))
@@ -617,7 +563,6 @@ if cached and cached.get("journeys"):
                 st.write("Fare Information Not Available")
 
 elif not search_button:
-    # Only show intro if no cached results
     st.info("👈 Enter journey details to get started")
     col1, col2 = st.columns(2)
     with col1:
